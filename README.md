@@ -39,3 +39,104 @@ cabe en una oración, el patrón probablemente sobra.
 - El dominio (`SolicitudReembolso`, `CategoriaGasto`, `EstadoSolicitud`) no dependerá de
   Spring ni de JPA. Los patrones vivirán en `procesamiento/` y solo el servicio de
   aplicación conocerá la persistencia.
+
+## Arquitectura resultante
+
+```
+com.empresa.reembolsos
+├── dominio/             SolicitudReembolso, CategoriaGasto, EstadoSolicitud   (Java puro: sin Spring ni JPA)
+├── procesamiento/
+│   ├── validacion/      Chain of Responsibility: ValidadorSolicitud + 4 eslabones, CadenaValidadores
+│   ├── calculo/         Strategy: CalculadoraReembolso + 3 calculadoras, SelectorCalculadora
+│   └── notificacion/    Observer: ObservadorCambioEstado + 3 notificadores
+├── aplicacion/          SolicitudReembolsoService (coordina los patrones), excepciones de aplicación
+├── infraestructura/     RepositorioSolicitudesJpa (Spring Data JPA)
+└── adaptadores/rest/    SolicitudReembolsoController (POST /api/solicitudes, PUT /api/solicitudes/{id}/estado)
+src/main/resources/META-INF/orm.xml   mapeo JPA de SolicitudReembolso
+```
+
+Las dependencias van en un solo sentido: `adaptadores → aplicacion → procesamiento → dominio`, y
+`aplicacion → infraestructura → dominio`. `procesamiento` nunca toca la persistencia:
+`ValidadorDuplicados` recibe la lista de solicitudes pendientes ya cargada por el servicio.
+
+**El dominio sin JPA y el repositorio con JPA.** El enunciado pide dos cosas que a primera vista
+chocan: que el modelo de dominio no importe nada de Spring ni de JPA, y que
+`RepositorioSolicitudesJpa` extienda `JpaRepository<SolicitudReembolso, Long>`, lo que exige que
+`SolicitudReembolso` sea una entidad. Se resolvió con el mapeo XML estándar de JPA:
+`META-INF/orm.xml` declara la entidad, su tabla, el id autogenerado y los enums como texto, y
+`spring.jpa.mapping-resources` lo carga. La clase de dominio queda como Java puro y el
+repositorio sigue siendo un `JpaRepository` directo, sin puertos ni mappers.
+
+## Pruebas (Parte 1)
+
+`./mvnw test` ejecuta 37 pruebas:
+
+| Clase de prueba | Casos | Qué cubre |
+|---|---|---|
+| `ValidadorDatosCompletosTest` | 3 | Solicitud completa, campos faltantes nombrados en el mensaje, monto cero |
+| `ValidadorDocumentosSoporteTest` | 2 | Con y sin documentos (mensaje claro) |
+| `ValidadorMontoMaximoTest` | 4 | Justo en el tope, sobre el tope, tope de viaje por días, viaje sin días |
+| `ValidadorDuplicadosTest` | 3 | Mismo mes y categoría, mismo mes de otro año, otra categoría |
+| `CadenaValidadoresTest` | 3 | Todo aprobado, primera falla según el orden, corte antes de datos nulos |
+| `CalculadoraViajeTest` / `CalculadoraRepresentacionTest` / `CalculadoraCapacitacionTest` | 2 c/u | Fórmula de la categoría y su tope |
+| `SelectorCalculadoraTest` | 3 | Selección por categoría, categoría sin calculadora, categoría duplicada |
+| `NotificadoresTest` | 4 | Contabilidad solo ante APROBADA; empleado y auditoría ante cualquier cambio |
+| `SolicitudReembolsoServiceTest` | 4 | Crear calcula y no sobrescribe; inválida no guarda; cambio de estado notifica a todos; inexistente no notifica |
+| `FlujoSolicitudReembolsoIntegracionTest` (`@SpringBootTest`) | 5 | API REST real con H2: las 3 categorías, notificación según el estado, 400 sin documentos, 400 por duplicado, 400 por tope, 404 |
+
+## Decisiones de diseño (Parte 1)
+
+**Decisión de diseño 1 — orden de la cadena: datos completos → documentos → monto →
+duplicados.** El criterio es costo creciente, porque el primer rechazo corta la cadena. Las
+verificaciones que solo miran la propia solicitud son constantes y baratas (comparar nulos, un
+booleano, un tope). `ValidadorDuplicados` es la única que recorre la lista de solicitudes
+pendientes del empleado, así que va al final: solo se ejecuta para las solicitudes que ya pasaron
+todo lo demás.
+
+- **Lo que se gana:** una solicitud sin documentos o fuera de tope se rechaza sin recorrer
+  ninguna lista. Además, `ValidadorDatosCompletos` va primero por una razón más fuerte que el
+  costo: los demás eslabones asumen categoría, monto y fecha no nulos, y ponerlo al inicio
+  garantiza que nunca reciban un nulo.
+- **Lo que se pierde:** el empleado ve un solo motivo a la vez. Una solicitud duplicada y sin
+  documentos se rechaza primero por documentos; al corregirlo, recién se entera de que estaba
+  duplicada. Con cualquier orden pasaría lo mismo con alguna combinación, porque la cadena corta
+  en el primer rechazo.
+- **Matiz honesto:** el ahorro es en la comparación, no en la consulta. El servicio carga las
+  pendientes del empleado antes de recorrer la cadena, así que esa consulta a la base de datos
+  se paga siempre. Diferirla exigiría pasar un `Supplier` a la cadena; no se hizo porque cada
+  empleado tiene pocas solicitudes pendientes (ver "Qué se descartó y por qué").
+
+**Decisión de diseño 2 — selección de la calculadora con un mapa construido desde
+`List<CalculadoraReembolso>`, no con un `switch`.** RF2 exige agregar categorías sin modificar el
+cálculo existente. Con el mapa, una categoría nueva es una clase nueva anotada con `@Component`:
+Spring la inyecta en la lista y `SelectorCalculadora` la registra sola, sin tocar una línea de
+las calculadoras ni del selector. Con un `switch`, cada categoría nueva obligaría a editar el
+método de selección, que es justamente la clase de cambio que RF2 quiere evitar. El mapa además
+falla al arrancar si dos calculadoras declaran la misma categoría (`IllegalStateException`), en
+lugar de elegir una en silencio.
+
+Siendo precisos con el alcance: una categoría nueva ("bienestar") también requiere agregar la
+constante a `CategoriaGasto` y su tope a `ValidadorMontoMaximo`. Ninguno de los dos cambios toca
+el cálculo de las categorías existentes, que es lo que pide RF2. Si se olvida el tope, el
+validador rechaza la solicitud con "No hay un tope configurado para la categoria BIENESTAR" en
+lugar de fallar con un error interno.
+
+## Ajustes respecto al código del enunciado
+
+- **Tope de VIAJE por días en `ValidadorMontoMaximo`.** El enunciado comparaba cualquier viaje
+  contra 150 000 fijos, pero RF2 define el tope de viáticos como diario × días. Así, un viaje de
+  3 días por 300 000 se rechazaba aunque su tope según RF2 es 450 000. Ahora el límite de VIAJE
+  es 150 000 × días, el mismo que aplica `CalculadoraViaje`; los de las otras categorías siguen
+  fijos.
+- **Período de `ValidadorDuplicados` con mes y año.** Comparaba solo el mes, así que una
+  solicitud pendiente de enero de 2025 bloqueaba una de enero de 2026.
+- **`ValidadorDatosCompletos` como primer eslabón.** Sin él, una solicitud sin categoría o sin
+  fecha terminaba en un `NullPointerException` y un error 500. Agregarlo no exigió modificar
+  ninguna verificación existente, que es justamente lo que RF1 promete.
+- **Respuestas de error claras.** El controlador traduce `SolicitudInvalidaException` a 400 y
+  `SolicitudNoEncontradaException` a 404, con `{"error": "<motivo>"}`. Sin esto, Spring Boot
+  responde 500 y oculta el mensaje.
+- **`crear` ignora el `id` del cuerpo.** Si el cliente enviaba un `id` existente, `save` habría
+  sobrescrito esa solicitud.
+- **Dominio sin JPA mediante `orm.xml`** (ver arriba), y **Spring Boot 3.5.16**, el último 3.x;
+  Spring Initializr ya solo ofrece la línea 4.
