@@ -15,14 +15,16 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 @AnalyzeClasses(packages = "com.empresa.reembolsos", importOptions = ImportOption.DoNotIncludeTests.class)
 public class ReglasArquitectura {
 
-    // Regla 1: procesamiento no depende de infraestructura, adaptadores ni JPA
+    // Regla 1: procesamiento no depende de infraestructura, adaptadores, JPA ni de la capa web
+    // de Spring. Las anotaciones de estereotipo (@Component) si se permiten (Decision 4).
     @ArchTest
     static final ArchRule procesamientoSinPersistenciaNiWeb = noClasses()
         .that().resideInAPackage("..procesamiento..")
         .should().dependOnClassesThat()
         .resideInAnyPackage(
             "..infraestructura..", "..adaptadores..",
-            "org.springframework.data..", "jakarta.persistence..");
+            "org.springframework.data..", "jakarta.persistence..",
+            "org.springframework.web..", "org.springframework.http..");
 
     // Regla 2: el controlador solo accede al servicio de aplicacion y al dominio.
     // Su propio paquete se permite porque ArchUnit cuenta como acceso el uso de los campos
