@@ -140,3 +140,55 @@ lugar de fallar con un error interno.
   sobrescrito esa solicitud.
 - **Dominio sin JPA mediante `orm.xml`** (ver arriba), y **Spring Boot 3.5.16**, el último 3.x;
   Spring Initializr ya solo ofrece la línea 4.
+
+## Qué se descartó y por qué
+
+Criterio aplicado (Guía, sección 4.2): ¿la variabilidad que justificaría la alternativa es real
+y está documentada hoy, o es especulación sobre un futuro que aún no llegó? Cada descarte es una
+decisión vigente hoy, no definitiva, y lleva la señal que obligaría a revisarla.
+
+### Ejemplos de referencia del enunciado
+
+**`ApplicationEventPublisher` en vez de una lista de observadores inyectada.** Se consideró
+publicar un evento de dominio con `ApplicationEventPublisher` y `@EventListener` (Guía, sección
+2.3). Se descartó porque, con tres observadores fijos y conocidos en tiempo de compilación, el bus
+de eventos genérico no aporta desacoplamiento real (ya lo da la interfaz `ObservadorCambioEstado`)
+y sí dificulta rastrear quién reacciona a qué cambio. *Señal para reconsiderar:* que algún
+interesado necesite reaccionar de forma asíncrona o fuera de la transacción, o que los
+interesados vivan en módulos que no deban conocerse.
+
+**Visitor o Abstract Factory para exportar reportes en varios formatos.** Se consideró anticipar
+exportaciones en PDF y Excel además de CSV. Se descartó porque hoy solo existe el requisito de
+CSV: no hay una segunda petición real de otro formato, así que no se cumple la Rule of Three.
+*Señal para reconsiderar:* que Contabilidad pida formalmente un segundo formato.
+
+### Elementos propios de esta implementación
+
+**1. State para las transiciones de `EstadoSolicitud`.** Al implementar `cambiarEstado` fue
+tentador modelar cada estado como una clase (PENDIENTE, APROBADA, RECHAZADA, REQUIERE_CORRECCION)
+con las transiciones válidas encapsuladas, para impedir, por ejemplo, volver de APROBADA a
+PENDIENTE. Se descartó porque ningún requisito define transiciones prohibidas ni un
+comportamiento que dependa del estado: RF3 solo pide avisar del cambio. El patrón no pasa el test
+de explicabilidad, porque para justificarlo en una oración habría que inventar reglas que
+Finanzas no pidió (YAGNI). *Señal para reconsiderar:* que Finanzas defina transiciones válidas
+(por ejemplo, "una solicitud aprobada no se puede rechazar") o acciones que solo apliquen en
+ciertos estados ("solo una solicitud en REQUIERE_CORRECCION se puede editar").
+
+**2. Una clase `PoliticaDeTopes` compartida por validación y cálculo.** Los topes aparecen dos
+veces: 150 000 diarios en `ValidadorMontoMaximo` y en `CalculadoraViaje`, 2 000 000 en
+`ValidadorMontoMaximo` y en `CalculadoraRepresentacion`, 3 000 000 en `ValidadorMontoMaximo` y en
+`CalculadoraCapacitacion`. Se consideró centralizarlos en una clase o en configuración. Se
+descartó porque cada valor aparece exactamente dos veces y es estable: no se cumple la Rule of
+Three, y una abstracción nueva acoplaría dos paquetes (`validacion` y `calculo`) que hoy son
+independientes. *Señal para reconsiderar:* un tercer lugar que necesite los topes (por ejemplo,
+un reporte que muestre el saldo disponible), o que Finanzas quiera cambiarlos sin recompilar, lo
+que llevaría a externalizarlos con `@ConfigurationProperties`.
+
+**3. Consulta diferida de las solicitudes pendientes (`Supplier`).** Como el servicio carga las
+pendientes del empleado antes de ejecutar la cadena, la consulta se paga aunque la solicitud se
+rechace en el primer eslabón (Decisión de diseño 1). Se consideró pasar un
+`Supplier<List<SolicitudReembolso>>` para consultar solo si se llega a `ValidadorDuplicados`. Se
+descartó porque cambia la firma de todos los eslabones para optimizar una consulta filtrada por
+empleado que devuelve muy pocas filas: es optimizar sin una medición que lo pida. *Señal para
+reconsiderar:* que una medición muestre esa consulta como cuello de botella, o que los empleados
+acumulen muchas solicitudes pendientes.
