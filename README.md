@@ -1,5 +1,7 @@
 # Sistema de Solicitudes de Reembolso de Gastos Corporativos
 
+![Validacion Arquitectonica](https://github.com/juanalfonso10/valbuena-post1-u12/actions/workflows/arquitectura.yml/badge.svg)
+
 Proyecto integrador de la Unidad 12 de Patrones de Diseño de Software. El área de Finanzas
 reemplaza una hoja de cálculo compartida por un sistema propio: los empleados registran
 solicitudes de reembolso (categoría, monto, fecha y documentos soporte), el sistema las
@@ -40,51 +42,7 @@ cabe en una oración, el patrón probablemente sobra.
   Spring ni de JPA. Los patrones vivirán en `procesamiento/` y solo el servicio de
   aplicación conocerá la persistencia.
 
-## Arquitectura resultante
-
-```
-com.empresa.reembolsos
-├── dominio/             SolicitudReembolso, CategoriaGasto, EstadoSolicitud   (Java puro: sin Spring ni JPA)
-├── procesamiento/
-│   ├── validacion/      Chain of Responsibility: ValidadorSolicitud + 4 eslabones, CadenaValidadores
-│   ├── calculo/         Strategy: CalculadoraReembolso + 3 calculadoras, SelectorCalculadora
-│   └── notificacion/    Observer: ObservadorCambioEstado + 3 notificadores
-├── aplicacion/          SolicitudReembolsoService (coordina los patrones), excepciones de aplicación
-├── infraestructura/     RepositorioSolicitudesJpa (Spring Data JPA)
-└── adaptadores/rest/    SolicitudReembolsoController (POST /api/solicitudes, PUT /api/solicitudes/{id}/estado)
-src/main/resources/META-INF/orm.xml   mapeo JPA de SolicitudReembolso
-```
-
-Las dependencias van en un solo sentido: `adaptadores → aplicacion → procesamiento → dominio`, y
-`aplicacion → infraestructura → dominio`. `procesamiento` nunca toca la persistencia:
-`ValidadorDuplicados` recibe la lista de solicitudes pendientes ya cargada por el servicio.
-
-**El dominio sin JPA y el repositorio con JPA.** El enunciado pide dos cosas que a primera vista
-chocan: que el modelo de dominio no importe nada de Spring ni de JPA, y que
-`RepositorioSolicitudesJpa` extienda `JpaRepository<SolicitudReembolso, Long>`, lo que exige que
-`SolicitudReembolso` sea una entidad. Se resolvió con el mapeo XML estándar de JPA:
-`META-INF/orm.xml` declara la entidad, su tabla, el id autogenerado y los enums como texto, y
-`spring.jpa.mapping-resources` lo carga. La clase de dominio queda como Java puro y el
-repositorio sigue siendo un `JpaRepository` directo, sin puertos ni mappers.
-
-## Pruebas (Parte 1)
-
-`./mvnw test` ejecuta 37 pruebas:
-
-| Clase de prueba | Casos | Qué cubre |
-|---|---|---|
-| `ValidadorDatosCompletosTest` | 3 | Solicitud completa, campos faltantes nombrados en el mensaje, monto cero |
-| `ValidadorDocumentosSoporteTest` | 2 | Con y sin documentos (mensaje claro) |
-| `ValidadorMontoMaximoTest` | 4 | Justo en el tope, sobre el tope, tope de viaje por días, viaje sin días |
-| `ValidadorDuplicadosTest` | 3 | Mismo mes y categoría, mismo mes de otro año, otra categoría |
-| `CadenaValidadoresTest` | 3 | Todo aprobado, primera falla según el orden, corte antes de datos nulos |
-| `CalculadoraViajeTest` / `CalculadoraRepresentacionTest` / `CalculadoraCapacitacionTest` | 2 c/u | Fórmula de la categoría y su tope |
-| `SelectorCalculadoraTest` | 3 | Selección por categoría, categoría sin calculadora, categoría duplicada |
-| `NotificadoresTest` | 4 | Contabilidad solo ante APROBADA; empleado y auditoría ante cualquier cambio |
-| `SolicitudReembolsoServiceTest` | 4 | Crear calcula y no sobrescribe; inválida no guarda; cambio de estado notifica a todos; inexistente no notifica |
-| `FlujoSolicitudReembolsoIntegracionTest` (`@SpringBootTest`) | 5 | API REST real con H2: las 3 categorías, notificación según el estado, 400 sin documentos, 400 por duplicado, 400 por tope, 404 |
-
-## Decisiones de diseño (Parte 1)
+## Decisiones de diseño
 
 **Decisión de diseño 1 — orden de la cadena: datos completos → documentos → monto →
 duplicados.** El criterio es costo creciente, porque el primer rechazo corta la cadena. Las
@@ -121,25 +79,44 @@ el cálculo de las categorías existentes, que es lo que pide RF2. Si se olvida 
 validador rechaza la solicitud con "No hay un tope configurado para la categoria BIENESTAR" en
 lugar de fallar con un error interno.
 
-## Ajustes respecto al código del enunciado
+**Decisión de diseño 3 — capas simples para la persistencia; ningún cambio en la notificación
+(ADR-001).** `SolicitudReembolsoService` sigue usando `RepositorioSolicitudesJpa` directamente,
+sin un puerto intermedio, porque no hay ningún plan de cambiar el motor de base de datos y el
+criterio de la Guía (sección 6.2: sistemas que vivirán 3 años o más con cambios de
+infraestructura) no se cumple para esa dependencia. Para la notificación sí hay un cambio con
+fecha, la API externa de Contabilidad el próximo trimestre, pero `ObservadorCambioEstado` ya es el
+punto de extensión que ese cambio necesita. El razonamiento completo, con las alternativas
+evaluadas, está en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md) y se resume más abajo.
 
-- **Tope de VIAJE por días en `ValidadorMontoMaximo`.** El enunciado comparaba cualquier viaje
-  contra 150 000 fijos, pero RF2 define el tope de viáticos como diario × días. Así, un viaje de
-  3 días por 300 000 se rechazaba aunque su tope según RF2 es 450 000. Ahora el límite de VIAJE
-  es 150 000 × días, el mismo que aplica `CalculadoraViaje`; los de las otras categorías siguen
-  fijos.
-- **Período de `ValidadorDuplicados` con mes y año.** Comparaba solo el mes, así que una
-  solicitud pendiente de enero de 2025 bloqueaba una de enero de 2026.
-- **`ValidadorDatosCompletos` como primer eslabón.** Sin él, una solicitud sin categoría o sin
-  fecha terminaba en un `NullPointerException` y un error 500. Agregarlo no exigió modificar
-  ninguna verificación existente, que es justamente lo que RF1 promete.
-- **Respuestas de error claras.** El controlador traduce `SolicitudInvalidaException` a 400 y
-  `SolicitudNoEncontradaException` a 404, con `{"error": "<motivo>"}`. Sin esto, Spring Boot
-  responde 500 y oculta el mensaje.
-- **`crear` ignora el `id` del cuerpo.** Si el cliente enviaba un `id` existente, `save` habría
-  sobrescrito esa solicitud.
-- **Dominio sin JPA mediante `orm.xml`** (ver arriba), y **Spring Boot 3.5.16**, el último 3.x;
-  Spring Initializr ya solo ofrece la línea 4.
+**Decisión de diseño 4 — la Regla 1 prohíbe acceso a datos y web, no todo `org.springframework`.**
+Los validadores, calculadoras y notificadores usan `@Component`, y eso es aceptable en
+`procesamiento` por dos razones:
+
+- **Una anotación de estereotipo es metadato de registro, no comportamiento.** No cambia lo que
+  hace la clase ni la ata a una tecnología de entrada o salida. Prueba de ello: todas las pruebas
+  unitarias de `procesamiento` crean estas clases con `new`, sin levantar Spring.
+- **El acceso a datos y la web sí acoplan la lógica.** Clases como `JpaRepository`,
+  `EntityManager` o las anotaciones de `jakarta.persistence` atan la regla de negocio a una base de
+  datos; `ResponseEntity` o `HttpStatus` la atan a HTTP. Eso es lo que `procesamiento` debe evitar:
+  sus reglas tienen que poder ejecutarse sin base de datos ni servidor web. Por eso la regla
+  prohíbe `org.springframework.data..`, `jakarta.persistence..`, `org.springframework.web..` y
+  `org.springframework.http..`, además de los paquetes `infraestructura` y `adaptadores` del
+  proyecto.
+
+Prohibir todo `org.springframework` obligaría a quitar las 12 anotaciones `@Component` del paquete
+y a registrar cada bean a mano en una clase `@Configuration`. Sería más código y más puntos de
+falla, sin ganar independencia real.
+
+## Resumen de ADR-001
+
+| | |
+|---|---|
+| **Decisión** | Capas simples: el servicio usa `RepositorioSolicitudesJpa` sin puerto intermedio; la notificación queda como está |
+| **Alternativas evaluadas** | A) Hexagonal completa; B) puerto solo para la persistencia; C) capas simples apoyadas en el seam de notificación (elegida) |
+| **Persistencia** | No hay cambio de motor previsto, así que un puerto sería una abstracción especulativa (YAGNI). Si se necesita, el costo está acotado: un solo servicio usa el repositorio y el dominio ya es independiente de JPA (`orm.xml`) |
+| **Notificación** | La API de Contabilidad del próximo trimestre se implementará como un `ObservadorCambioEstado` en `infraestructura`, que reemplazará a `NotificadorContabilidad`, sin modificar el servicio ni los demás observadores |
+| **Consecuencia negativa aceptada** | Un cambio de motor de base de datos obligaría a introducir el puerto de forma retroactiva; además, la asimetría puede parecer inconsistente a quien no lea el ADR |
+| **Revisar si** | Se aprueba otro motor o un segundo almacenamiento, o el servicio necesita probarse sin Spring Data |
 
 ## Qué se descartó y por qué
 
@@ -192,3 +169,143 @@ descartó porque cambia la firma de todos los eslabones para optimizar una consu
 empleado que devuelve muy pocas filas: es optimizar sin una medición que lo pida. *Señal para
 reconsiderar:* que una medición muestre esa consulta como cuello de botella, o que los empleados
 acumulen muchas solicitudes pendientes.
+
+## Arquitectura resultante
+
+```
+com.empresa.reembolsos
+├── dominio/             SolicitudReembolso, CategoriaGasto, EstadoSolicitud   (Java puro: sin Spring ni JPA)
+├── procesamiento/
+│   ├── validacion/      Chain of Responsibility: ValidadorSolicitud + 4 eslabones, CadenaValidadores
+│   ├── calculo/         Strategy: CalculadoraReembolso + 3 calculadoras, SelectorCalculadora
+│   └── notificacion/    Observer: ObservadorCambioEstado + 3 notificadores
+├── aplicacion/          SolicitudReembolsoService (coordina los patrones), excepciones de aplicación
+├── infraestructura/     RepositorioSolicitudesJpa (Spring Data JPA)
+└── adaptadores/rest/    SolicitudReembolsoController (POST /api/solicitudes, PUT /api/solicitudes/{id}/estado)
+src/main/resources/META-INF/orm.xml   mapeo JPA de SolicitudReembolso
+```
+
+Las dependencias van en un solo sentido: `adaptadores → aplicacion → procesamiento → dominio`, y
+`aplicacion → infraestructura → dominio`. `procesamiento` nunca toca la persistencia:
+`ValidadorDuplicados` recibe la lista de solicitudes pendientes ya cargada por el servicio.
+
+**El dominio sin JPA y el repositorio con JPA.** El enunciado pide dos cosas que a primera vista
+chocan: que el modelo de dominio no importe nada de Spring ni de JPA, y que
+`RepositorioSolicitudesJpa` extienda `JpaRepository<SolicitudReembolso, Long>`, lo que exige que
+`SolicitudReembolso` sea una entidad. Se resolvió con el mapeo XML estándar de JPA:
+`META-INF/orm.xml` declara la entidad, su tabla, el id autogenerado y los enums como texto, y
+`spring.jpa.mapping-resources` lo carga. La clase de dominio queda como Java puro y el
+repositorio sigue siendo un `JpaRepository` directo, sin puertos ni mappers.
+
+## Reglas de arquitectura y pipeline
+
+`ReglasArquitectura` (ArchUnit) verifica los límites que sí existen, sin asumir puertos de
+persistencia (coherente con ADR-001):
+
+| Regla | Qué protege |
+|---|---|
+| `procesamientoSinPersistenciaNiWeb` | `procesamiento` no depende de `infraestructura`, `adaptadores`, Spring Data, JPA ni de la capa web de Spring |
+| `controladorSoloUsaServicio` | El controlador solo usa la aplicación, el dominio, Spring Web/HTTP y el JDK; nunca el repositorio ni los patrones |
+| `calculadorasImplementanInterfaz` | Toda clase `Calculadora*` de `procesamiento.calculo` es una estrategia `CalculadoraReembolso` |
+| `notificadoresImplementanInterfaz` | Toda clase concreta de `procesamiento.notificacion` es un `ObservadorCambioEstado` |
+
+**El pipeline.** `.github/workflows/arquitectura.yml` corre en cada push y pull request a `main`:
+primero `mvn test -Dtest=ReglasArquitectura` y luego `mvn verify` con la suite completa. Para
+comprobar que de verdad detecta violaciones, se subió el commit
+`test: violacion de arquitectura intencional`, que inyecta `RepositorioSolicitudesJpa` en
+`ValidadorDuplicados`. El job falló en el paso de las reglas con la violación de
+`procesamientoSinPersistenciaNiWeb`. Después, `git revert HEAD` devolvió el pipeline a verde.
+
+Historial de ejecuciones de GitHub Actions (verde, rojo por la violación, verde tras el revert):
+![Historial del pipeline](docs/pipeline-historial.png)
+
+Detalle de la ejecución fallida, con el mensaje de ArchUnit:
+![Ejecución fallida por la violación](docs/pipeline-fallido.png)
+
+## Pruebas
+
+`./mvnw test` ejecuta 41 pruebas: las 4 reglas de arquitectura y las 37 de abajo.
+
+| Clase de prueba | Casos | Qué cubre |
+|---|---|---|
+| `ValidadorDatosCompletosTest` | 3 | Solicitud completa, campos faltantes nombrados en el mensaje, monto cero |
+| `ValidadorDocumentosSoporteTest` | 2 | Con y sin documentos (mensaje claro) |
+| `ValidadorMontoMaximoTest` | 4 | Justo en el tope, sobre el tope, tope de viaje por días, viaje sin días |
+| `ValidadorDuplicadosTest` | 3 | Mismo mes y categoría, mismo mes de otro año, otra categoría |
+| `CadenaValidadoresTest` | 3 | Todo aprobado, primera falla según el orden, corte antes de datos nulos |
+| `CalculadoraViajeTest` / `CalculadoraRepresentacionTest` / `CalculadoraCapacitacionTest` | 2 c/u | Fórmula de la categoría y su tope |
+| `SelectorCalculadoraTest` | 3 | Selección por categoría, categoría sin calculadora, categoría duplicada |
+| `NotificadoresTest` | 4 | Contabilidad solo ante APROBADA; empleado y auditoría ante cualquier cambio |
+| `SolicitudReembolsoServiceTest` | 4 | Crear calcula y no sobrescribe; inválida no guarda; cambio de estado notifica a todos; inexistente no notifica |
+| `FlujoSolicitudReembolsoIntegracionTest` (`@SpringBootTest`) | 5 | API REST real con H2: las 3 categorías, notificación según el estado, 400 sin documentos, 400 por duplicado, 400 por tope, 404 |
+
+## Ajustes respecto al código del enunciado
+
+- **Tope de VIAJE por días en `ValidadorMontoMaximo`.** El enunciado comparaba cualquier viaje
+  contra 150 000 fijos, pero RF2 define el tope de viáticos como diario × días. Así, un viaje de
+  3 días por 300 000 se rechazaba aunque su tope según RF2 es 450 000. Ahora el límite de VIAJE
+  es 150 000 × días, el mismo que aplica `CalculadoraViaje`; los de las otras categorías siguen
+  fijos.
+- **Período de `ValidadorDuplicados` con mes y año.** Comparaba solo el mes, así que una
+  solicitud pendiente de enero de 2025 bloqueaba una de enero de 2026.
+- **`ValidadorDatosCompletos` como primer eslabón.** Sin él, una solicitud sin categoría o sin
+  fecha terminaba en un `NullPointerException` y un error 500. Agregarlo no exigió modificar
+  ninguna verificación existente, que es justamente lo que RF1 promete.
+- **Respuestas de error claras.** El controlador traduce `SolicitudInvalidaException` a 400 y
+  `SolicitudNoEncontradaException` a 404, con `{"error": "<motivo>"}`. Sin esto, Spring Boot
+  responde 500 y oculta el mensaje.
+- **`crear` ignora el `id` del cuerpo.** Si el cliente enviaba un `id` existente, `save` habría
+  sobrescrito esa solicitud.
+- **Dominio sin JPA mediante `orm.xml`** (ver arriba), y **Spring Boot 3.5.16**, el último 3.x;
+  Spring Initializr ya solo ofrece la línea 4.
+- **Reglas ArchUnit que funcionan contra el propio diseño.** Tal como venían, 3 de las 4 reglas
+  fallaban contra el código del enunciado:
+  - **Pruebas en el análisis.** `@AnalyzeClasses` analizaba también las clases de prueba, y
+    `CalculadoraViajeTest` o `NotificadoresTest` "no implementaban" la interfaz. Se agregó
+    `importOptions = ImportOption.DoNotIncludeTests.class`.
+  - **Regla 2 y el propio controlador.** Fallaba porque ArchUnit cuenta como acceso el uso de los
+    campos de la propia clase (`this.servicio`); se permitió el paquete `..adaptadores.rest..`.
+  - **Regla 3 y el selector.** Exigía que `SelectorCalculadora` implementara
+    `CalculadoraReembolso`; se limitó a las clases `Calculadora*`.
+  - **Regla 1 sin la web.** Se le agregaron `org.springframework.web..` y
+    `org.springframework.http..` para que cumpla lo que promete su nombre (Decisión 4).
+- **Las reglas también corren con `mvn test`.** `ReglasArquitectura` no sigue el patrón `*Test`
+  de Surefire, así que `mvn test` y `mvn verify` la ignoraban y solo se ejecutaba con
+  `-Dtest=ReglasArquitectura`. Se agregó a los `includes` de Surefire en el `pom.xml`.
+- **La violación intencional usa el repositorio, no solo lo importa.** El enunciado propone
+  "importar `RepositorioSolicitudesJpa` dentro de `ValidadorDuplicados`", pero un `import` sin uso
+  desaparece al compilar y ArchUnit analiza el bytecode: se comprobó que con solo el `import` las 4
+  reglas pasan y el pipeline habría salido verde. La violación declara un campo inyectado de ese
+  tipo, que compila y deja intactas las demás pruebas, así que lo único que falla es la Regla 1.
+- **Acciones de GitHub vigentes.** El workflow del enunciado usaba `actions/cache@v3`, que declara
+  el runtime Node 16, y `checkout@v4` / `setup-java@v4` en Node 20; ambos runtimes están siendo
+  retirados por GitHub. Se usaron `checkout@v6`, `setup-java@v5` y `cache@v5` (Node 24), con los
+  mismos parámetros.
+
+## Ejecutar
+```bash
+./mvnw test                          # 41 pruebas, incluidas las reglas de arquitectura
+./mvnw test -Dtest=ReglasArquitectura
+./mvnw spring-boot:run               # API en http://localhost:8080
+
+curl -X POST localhost:8080/api/solicitudes -H 'Content-Type: application/json' \
+  -d '{"empleadoId":"E1","categoria":"CAPACITACION","montoSolicitado":2000000,"fechaGasto":"2026-10-10","documentosSoporte":true}'
+curl -X PUT localhost:8080/api/solicitudes/1/estado -H 'Content-Type: application/json' -d '"APROBADA"'
+```
+
+## Herramientas utilizadas
+- Java 17, Spring Boot 3.5 (Web, Data JPA), H2, JUnit 5, Mockito, AssertJ, ArchUnit 1.2
+- Apache Maven, GitHub Actions, Git, GitHub
+
+## Conclusiones
+Elegir los patrones a partir de los requisitos, y no al revés, hizo que cada uno resolviera un
+problema distinto y explicable en una oración: Chain of Responsibility para verificaciones que
+crecen, Strategy para fórmulas que se eligen por categoría y Observer para interesados que se
+multiplican. Implementarlos destapó problemas que el enunciado no mencionaba (un tope de viaje que
+ignoraba los días, un período sin año, reglas de arquitectura que fallaban contra su propio diseño
+y una violación que no podía detectarse), y cada uno se resolvió con evidencia: pruebas, HTTP real
+o una ejecución del pipeline. La decisión arquitectónica mostró que la Hexagonal no es un
+todo o nada: el criterio de la Guía se aplicó dependencia por dependencia, y el seam que el
+cambio con fecha necesitaba ya existía. Por último, el ejercicio de qué se descartó dejó claro que
+no agregar un patrón también es una decisión de diseño, siempre que quede escrita con la señal que
+obligaría a revisarla.
